@@ -33,6 +33,10 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Label;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.util.TraceClassVisitor;
 
@@ -498,6 +502,130 @@ public class RasTransformTest extends LibertyRuntimeTransformer {
 		isTransformPossible.setAccessible(true);
 		return (isTransformPossible.invoke(null, bytes) == null);
 	}
-	
+
+	@Test
+	public void testIsolatedClassLoaderResolutionDuringRetransform() throws Exception {
+		// 1. Generate CommonParent bytecode
+		ClassWriter cwParent = new ClassWriter(0);
+		cwParent.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, "com/example/isolated/CommonParent", null, "java/lang/Object", null);
+		MethodVisitor mvParent = cwParent.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+		mvParent.visitCode();
+		mvParent.visitVarInsn(Opcodes.ALOAD, 0);
+		mvParent.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+		mvParent.visitInsn(Opcodes.RETURN);
+		mvParent.visitMaxs(1, 1);
+		mvParent.visitEnd();
+		cwParent.visitEnd();
+		byte[] parentBytes = cwParent.toByteArray();
+
+		// 2. Generate ClassA bytecode (extends CommonParent)
+		ClassWriter cwA = new ClassWriter(0);
+		cwA.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, "com/example/isolated/ClassA", null, "com/example/isolated/CommonParent", null);
+		MethodVisitor mvA = cwA.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+		mvA.visitCode();
+		mvA.visitVarInsn(Opcodes.ALOAD, 0);
+		mvA.visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/isolated/CommonParent", "<init>", "()V", false);
+		mvA.visitInsn(Opcodes.RETURN);
+		mvA.visitMaxs(1, 1);
+		mvA.visitEnd();
+		cwA.visitEnd();
+		byte[] classABytes = cwA.toByteArray();
+
+		// 3. Generate ClassB bytecode (extends CommonParent)
+		ClassWriter cwB = new ClassWriter(0);
+		cwB.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, "com/example/isolated/ClassB", null, "com/example/isolated/CommonParent", null);
+		MethodVisitor mvB = cwB.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+		mvB.visitCode();
+		mvB.visitVarInsn(Opcodes.ALOAD, 0);
+		mvB.visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/isolated/CommonParent", "<init>", "()V", false);
+		mvB.visitInsn(Opcodes.RETURN);
+		mvB.visitMaxs(1, 1);
+		mvB.visitEnd();
+		cwB.visitEnd();
+		byte[] classBBytes = cwB.toByteArray();
+
+		// 4. Generate TargetClass bytecode
+		// Constructor has ASTORE before super() to trigger ComputeRequiredException (like JaCoCo $jacocoInit)
+		// Method 'choose' merges ClassA and ClassB onto stack, requiring getCommonSuperClass during COMPUTE_FRAMES
+		ClassWriter cwTarget = new ClassWriter(0);
+		cwTarget.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, "com/example/isolated/TargetClass", null, "java/lang/Object", null);
+
+		MethodVisitor mvInit = cwTarget.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+		mvInit.visitCode();
+		mvInit.visitInsn(Opcodes.ACONST_NULL);
+		mvInit.visitVarInsn(Opcodes.ASTORE, 1);
+		mvInit.visitVarInsn(Opcodes.ALOAD, 0);
+		mvInit.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+		mvInit.visitInsn(Opcodes.RETURN);
+		mvInit.visitMaxs(2, 2);
+		mvInit.visitEnd();
+
+		MethodVisitor mvChoose = cwTarget.visitMethod(Opcodes.ACC_PUBLIC, "choose", "(Z)Lcom/example/isolated/CommonParent;", null, null);
+		mvChoose.visitCode();
+		Label l0 = new Label();
+		Label l1 = new Label();
+		mvChoose.visitVarInsn(Opcodes.ILOAD, 1);
+		mvChoose.visitJumpInsn(Opcodes.IFNE, l0);
+		mvChoose.visitTypeInsn(Opcodes.NEW, "com/example/isolated/ClassA");
+		mvChoose.visitInsn(Opcodes.DUP);
+		mvChoose.visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/isolated/ClassA", "<init>", "()V", false);
+		mvChoose.visitJumpInsn(Opcodes.GOTO, l1);
+		mvChoose.visitLabel(l0);
+		mvChoose.visitTypeInsn(Opcodes.NEW, "com/example/isolated/ClassB");
+		mvChoose.visitInsn(Opcodes.DUP);
+		mvChoose.visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/isolated/ClassB", "<init>", "()V", false);
+		mvChoose.visitLabel(l1);
+		mvChoose.visitInsn(Opcodes.ARETURN);
+		mvChoose.visitMaxs(2, 2);
+		mvChoose.visitEnd();
+
+		cwTarget.visitEnd();
+		byte[] targetBytes = cwTarget.toByteArray();
+
+		// Put classes in an isolated ByteArrayClassLoader
+		Map<String, byte[]> classDefs = new HashMap<String, byte[]>();
+		classDefs.put("com.example.isolated.CommonParent", parentBytes);
+		classDefs.put("com.example.isolated.ClassA", classABytes);
+		classDefs.put("com.example.isolated.ClassB", classBBytes);
+		classDefs.put("com.example.isolated.TargetClass", targetBytes);
+
+		ByteArrayClassLoader customLoader = new ByteArrayClassLoader(getClass().getClassLoader(), classDefs);
+		customLoader.setPackage("com.example.isolated");
+
+		// 1. Direct transformation with custom ClassLoader without preprocessing (skipIfNotPreprocessed = false)
+		byte[] transformedDirect = LibertyRuntimeTransformer.transform(customLoader, "com.example.isolated.TargetClass", targetBytes, false);
+		assertTrue("Transformed bytes should not be null", transformedDirect != null);
+
+		// 2. Preprocessed transformation simulating runtime transformation hook (skipIfNotPreprocessed = true)
+		byte[] staticInjected = staticTransform.transform("com.example.isolated.TargetClass", targetBytes);
+		if (staticInjected == null) {
+			staticInjected = targetBytes;
+		}
+		LibertyRuntimeTransformer transformer = new LibertyRuntimeTransformer();
+		LibertyRuntimeTransformer.setInjectAtTransform(true);
+		byte[] transformedRuntime = transformer.transform(customLoader, "com.example.isolated.TargetClass", null, null, staticInjected);
+		assertTrue("Transformed runtime bytes should not be null", transformedRuntime != null);
+
+		// 3. Verify that the transformed bytecode can be loaded and executed successfully
+		Map<String, byte[]> postTransformDefs = new HashMap<String, byte[]>();
+		postTransformDefs.put("com.example.isolated.CommonParent", parentBytes);
+		postTransformDefs.put("com.example.isolated.ClassA", classABytes);
+		postTransformDefs.put("com.example.isolated.ClassB", classBBytes);
+		postTransformDefs.put("com.example.isolated.TargetClass", transformedDirect);
+
+		try (ByteArrayClassLoader executionLoader = new ByteArrayClassLoader(getClass().getClassLoader(), postTransformDefs)) {
+			executionLoader.setPackage("com.example.isolated");
+			Class<?> loadedTarget = executionLoader.loadClass("com.example.isolated.TargetClass");
+			Object targetInstance = loadedTarget.getDeclaredConstructor().newInstance();
+
+			Method chooseMethod = loadedTarget.getMethod("choose", boolean.class);
+			Object resultA = chooseMethod.invoke(targetInstance, false);
+			assertTrue("Expected instance of ClassA", resultA != null && resultA.getClass().getName().equals("com.example.isolated.ClassA"));
+
+			Object resultB = chooseMethod.invoke(targetInstance, true);
+			assertTrue("Expected instance of ClassB", resultB != null && resultB.getClass().getName().equals("com.example.isolated.ClassB"));
+		}
+	}
+
 }
 
