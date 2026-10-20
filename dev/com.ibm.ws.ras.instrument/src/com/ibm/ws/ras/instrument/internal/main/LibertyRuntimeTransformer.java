@@ -1,10 +1,10 @@
 /*******************************************************************************
- * Copyright (c) 2010, 2023 IBM Corporation and others.
+ * Copyright (c) 2010, 2026 IBM Corporation and others.
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License 2.0
  * which accompanies this distribution, and is available at
  * http://www.eclipse.org/legal/epl-2.0/
- * 
+ *
  * SPDX-License-Identifier: EPL-2.0
  *
  * Contributors:
@@ -341,11 +341,13 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
             fileDump(methodName, "Initial bytes", initialBytes);
         }
 
+        ClassLoader targetLoader = (loader != null) ? loader : (classBeingRedefined != null ? classBeingRedefined.getClassLoader() : null);
+
         byte[] finalBytes;
         try {
-            finalBytes = transform(className, initialBytes);
+            finalBytes = transform(targetLoader, className, initialBytes, true);
         } catch (Throwable t) {
-            fileStack(methodName, "Transform failure [ " + className + " ]", t); 
+            fileStack(methodName, "Transform failure [ " + className + " ]", t);
             Tr.error(tc, "INSTRUMENTATION_TRANSFORM_FAILED_FOR_CLASS_2", className, t);
             return null;
         }
@@ -359,11 +361,15 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
     //
 
     public static byte[] transform(String className, byte[] bytes) throws IOException {
-        return transform(className, bytes, true);
-    }    
+        return transform(null, className, bytes, true);
+    }
     
     public static byte[] transform(byte[] bytes, boolean skipIfNotPreprocessed) throws IOException {
-        return transform(null, bytes, skipIfNotPreprocessed);
+        return transform(null, null, bytes, skipIfNotPreprocessed);
+    }
+
+    public static byte[] transform(String className, byte[] classBytes, boolean skipIfNotPreprocessed) throws IOException {
+        return transform(null, className, classBytes, skipIfNotPreprocessed);
     }
 
     /*
@@ -378,16 +384,17 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
      * frame computation disabled.  A {@link ComputeRequiredException} is thrown
      * if frame computation is required, which is caught and the transformation is
      * attempted a second time with frame computation enabled.
-     * 
+     *
+     * @param loader Optional: The ClassLoader that loaded or will load the class.
      * @param className Optional: The name of the target class.
      * @param classBytes The class bytes which are to be transformed.
      * @param skipIfNotPreprocessed Control parameter.  When true, the
      *     transformation will be skipped if the target class was not
      *     preprocessed.
-     *     
+     *
      * @return The transformed class bytes.  Null if no changes were made.
      */
-    public static byte[] transform(String className, byte[] classBytes, boolean skipIfNotPreprocessed) throws IOException {
+    public static byte[] transform(ClassLoader loader, String className, byte[] classBytes, boolean skipIfNotPreprocessed) throws IOException {
         String methodName = "transform";
 
         String debugClassName = ((className != null) ? className : "**UNKNOWN**" );
@@ -413,7 +420,7 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
         // The class writer must be retained, since it has the updated class bytes.
 
         ClassReader classReader = new ClassReader(classBytes);
-        ClassWriter classWriter = new ClassWriter(classReader, ClassWriter.COMPUTE_MAXS);
+        ClassWriter classWriter = new LibertyClassWriter(classReader, ClassWriter.COMPUTE_MAXS, loader);
         
         PrintWriter traceWriter = ( isLoggable ? fileWriter() : null );
         StringWriter baseDumpWriter = ( isDumpable ? new StringWriter() : null );
@@ -434,7 +441,7 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
                 // Second try: Use COMPUTE_FRAMES and !THROW_COMPUTE_FRAMES.
 
                 classReader = new ClassReader(classBytes);
-                classWriter = new ClassWriter(classReader, ClassWriter.COMPUTE_FRAMES);
+                classWriter = new LibertyClassWriter(classReader, ClassWriter.COMPUTE_FRAMES, loader);
 
                 traceWriter = ( isLoggable ? fileWriter() : null );
                 baseDumpWriter = ( isDumpable ? new StringWriter() : null );
@@ -443,7 +450,7 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
                 
                 isModified = visit(classReader, classVisitor,
                                    !AbstractRasClassAdapter.THROW_COMPUTE_FRAMES,
-                                   skipIfNotPreprocessed);             
+                                   skipIfNotPreprocessed);
             }
 
         } catch ( Throwable t ) {
@@ -458,6 +465,51 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
             fileLog(methodName, "IsModified [ " + debugClassName + " ]", Boolean.valueOf(isModified));
         }
         return ( !isModified ? null : classWriter.toByteArray() );
+    }
+
+    private static class LibertyClassWriter extends ClassWriter {
+        private final ClassLoader classLoader;
+
+        public LibertyClassWriter(ClassReader classReader, int flags, ClassLoader classLoader) {
+            super(classReader, flags);
+            this.classLoader = classLoader;
+        }
+
+        @Override
+        protected ClassLoader getClassLoader() {
+            return (classLoader != null) ? classLoader : super.getClassLoader();
+        }
+
+        @Override
+        protected String getCommonSuperClass(final String type1, final String type2) {
+            ClassLoader cl = getClassLoader();
+            Class<?> class1;
+            Class<?> class2;
+            try {
+                class1 = Class.forName(type1.replace('/', '.'), false, cl);
+            } catch (ClassNotFoundException e) {
+                throw new TypeNotPresentException(type1, e);
+            }
+            try {
+                class2 = Class.forName(type2.replace('/', '.'), false, cl);
+            } catch (ClassNotFoundException e) {
+                throw new TypeNotPresentException(type2, e);
+            }
+            if (class1.isAssignableFrom(class2)) {
+                return type1;
+            }
+            if (class2.isAssignableFrom(class1)) {
+                return type2;
+            }
+            if (class1.isInterface() || class2.isInterface()) {
+                return "java/lang/Object";
+            } else {
+                do {
+                    class1 = class1.getSuperclass();
+                } while (!class1.isAssignableFrom(class2));
+                return class1.getName().replace('.', '/');
+            }
+        }
     }
 
     /**
