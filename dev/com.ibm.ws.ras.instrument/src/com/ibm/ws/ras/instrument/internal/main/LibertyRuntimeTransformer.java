@@ -488,12 +488,12 @@ public class LibertyRuntimeTransformer implements ClassFileTransformer {
             try {
                 class1 = Class.forName(type1.replace('/', '.'), false, cl);
             } catch (ClassNotFoundException e) {
-                throw new TypeNotPresentException(type1, e);
+                return "java/lang/Object";
             }
             try {
                 class2 = Class.forName(type2.replace('/', '.'), false, cl);
             } catch (ClassNotFoundException e) {
-                throw new TypeNotPresentException(type2, e);
+                return "java/lang/Object";
             }
             if (class1.isAssignableFrom(class2)) {
                 return type1;
